@@ -389,6 +389,26 @@ def insert_prompt_into_db(user_message, response):
 
     logger.info(f"Prompt successfully inserted into database with ID: {prompt_id}")
 
+
+finalize_thread = None
+thread_lock = threading.Lock()
+
+def start_finalize_thread(target_function, args):
+    """
+    Starts a thread for the given target function, ensuring only one thread runs at a time.
+    """
+    global finalize_thread
+
+    with thread_lock:
+        if finalize_thread is not None and finalize_thread.is_alive():
+            # Wait for the current thread to finish
+            finalize_thread.join()
+
+        # Start a new thread
+        finalize_thread = threading.Thread(target=target_function, args=args, daemon=True)
+        finalize_thread.start()
+
+
 @app.post(
     "/generate",
     response_model=ChainResponse,
@@ -410,9 +430,6 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
     response_buffer = StringIO()
 
     update_db_flag = "update db" in last_user_message.lower()
-
-    if "update db" in last_user_message.lower():
-        insert_prompt_into_db(last_user_message, "")
 
     # Find and remove the last user message if present
     for i in reversed(range(len(chat_history))):
@@ -515,9 +532,11 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
 
         res, res_copy = tee_generator(res)
 
-        thread = threading.Thread(target=finalize, args=(res,), daemon=True)
-        thread.start()
+        # thread = threading.Thread(target=finalize, args=(res,), daemon=True)
+        # thread.start()
 
+        # Call this where needed
+        finalize(res)
         return StreamingResponse(res_copy, media_type="text/event-stream")
 
     except (MilvusException, MilvusUnavailableException) as e:
