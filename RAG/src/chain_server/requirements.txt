@@ -29,3 +29,5 @@ bleach==6.1.0
 flatdict==4.0.1
 chardet==5.2.0
 nltk==3.8.1
+snowflake-connector-python==3.12.3
+asyncio

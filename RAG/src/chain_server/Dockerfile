@@ -36,7 +36,7 @@ ENV HF_HOME=/tmp-data
 RUN python3.10 -m nltk.downloader averaged_perceptron_tagger
 RUN python3.10 -m nltk.downloader stopwords
 RUN python3.10 -m nltk.downloader punkt
-RUN python3.10 -c "from sentence_transformers import SentenceTransformer; model = SentenceTransformer('Snowflake/snowflake-arctic-embed-l'); model.save('/tmp-data')"
+# RUN python3.10 -c "from sentence_transformers import SentenceTransformer; model = SentenceTransformer('Snowflake/snowflake-arctic-embed-l'); model.save('/tmp-data')"
 
 # Install any example specific dependency if available
 ARG EXAMPLE_PATH

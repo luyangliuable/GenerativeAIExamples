@@ -19,12 +19,16 @@ import json
 import logging
 import os
 import shutil
+import threading
+import itertools
 from inspect import getmembers, isclass
 from pathlib import Path
 from typing import Any, Dict, List
 from uuid import uuid4
-
+from datetime import datetime  # Import for generating timestamps
+import snowflake.connector
 import bleach
+from io import StringIO
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -245,6 +249,48 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
         content={"detail": jsonable_encoder(exc.errors(), exclude={"input"})},
     )
 
+@app.get(
+    "/connect-db",
+    response_model=HealthResponse,
+    responses={
+        500: {
+            "description": "Internal Server Error",
+            "content": {"application/json": {"example": {"detail": "Internal server error occurred"}}},
+        }
+    },
+)
+def connect_db():
+    """
+    Connects to the DB
+
+    Returns 200 when service is up. This does not check the health of downstream services.
+    """
+    SNOWFLAKE_CONFIG = {
+        "user": "hackathon",
+        "password": "GKa!MP9HEW1B",
+        "account": "leunose-gq01569",
+        "database": "DIGITAL_HUMAN_HACKATHON",
+        "schema": "PUBLIC",
+    }
+
+    try:
+        # Establish connection to Snowflake
+        connection = snowflake.connector.connect(**SNOWFLAKE_CONFIG)
+        # Optionally, perform a simple query to ensure the connection is valid
+        cursor = connection.cursor()
+        cursor.execute("SELECT CURRENT_DATE;")
+        cursor.close()
+        connection.close()
+
+        # Return success response
+        return HealthResponse(message="DB is up and reachable.")
+    except Exception as e:
+        # Log error and return 500 response
+        logger.error(f"Error connecting to the database: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed.")
+
+    
+
 
 @app.get(
     "/health",
@@ -309,6 +355,39 @@ async def upload_document(request: Request, file: UploadFile = File(...)) -> JSO
         )
         return JSONResponse(content={"message": str(e)}, status_code=500)
 
+SNOWFLAKE_CONFIG = {
+    "user": "hackathon",
+    "password": "GKa!MP9HEW1B",
+    "account": "leunose-gq01569",
+    "database": "DIGITAL_HUMAN_HACKATHON",
+    "schema": "PUBLIC",
+}
+
+def insert_prompt_into_db(user_message, response):
+    """
+    Inserts a row into the prompt_table with the user's message and response.
+    """
+    # Connect to the Snowflake database
+    connection = snowflake.connector.connect(**SNOWFLAKE_CONFIG)
+    cursor = connection.cursor()
+
+    # Prepare and execute the INSERT query
+    insert_query = """
+    INSERT INTO prompt_table (id, user_message, response, created_at)
+    VALUES (%s, %s, %s, %s)
+    """
+    prompt_id = str(uuid4())
+    created_at = datetime.utcnow()
+    cursor.execute(insert_query, (prompt_id, user_message, response, created_at))
+
+    # Commit the transaction
+    connection.commit()
+
+    # Clean up
+    cursor.close()
+    connection.close()
+
+    logger.info(f"Prompt successfully inserted into database with ID: {prompt_id}")
 
 @app.post(
     "/generate",
@@ -327,6 +406,13 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
     chat_history = prompt.messages
     # The last user message will be the query for the rag or llm chain
     last_user_message = next((message.content for message in reversed(chat_history) if message.role == 'user'), None)
+
+    response_buffer = StringIO()
+
+    update_db_flag = "update db" in last_user_message.lower()
+
+    if "update db" in last_user_message.lower():
+        insert_prompt_into_db(last_user_message, "")
 
     # Find and remove the last user message if present
     for i in reversed(range(len(chat_history))):
@@ -356,6 +442,7 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
                 logger.debug(f"Generated response chunks\n")
                 # Create ChainResponse object for every token generated
                 for chunk in generator:
+                    response_buffer.write(chunk)
                     chain_response = ChainResponse()
                     response_choice = ChainResponseChoices(index=0, message=Message(role="assistant", content=chunk))
                     chain_response.id = resp_id
@@ -375,7 +462,63 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
                 chain_response = ChainResponse()
                 yield "data: " + str(chain_response.json()) + "\n\n"
 
-        return StreamingResponse(response_generator(), media_type="text/event-stream")
+        def finalize(res):
+            """Finalize the stream by inserting into the database if needed."""
+            if update_db_flag:
+                for response in res:
+                    # Process each chunk of the generator's output
+                    logger.info(str(response))
+                    if "[DONE]" in str(response):
+                        response_content = response_buffer.getvalue()  # Get the entire buffered response
+                        insert_prompt_into_db(last_user_message, response_content)
+                        break  # Exit the loop if finalization condition is met
+
+        res = response_generator()
+
+        def tee_generator(generator):
+            """
+            Clone a synchronous generator into two iterators using a shared buffer.
+            Ensures the generator is consumed safely by buffering its output.
+            """
+            from collections import deque
+            import threading
+
+            buffer = deque()
+            lock = threading.Lock()
+            stop_iteration_flag = False
+
+            def feeder():
+                """Feeds items from the generator into the buffer."""
+                nonlocal stop_iteration_flag
+                try:
+                    for item in generator:
+                        with lock:
+                            buffer.append(item)
+                except StopIteration:
+                    pass
+                finally:
+                    stop_iteration_flag = True
+
+            def clone():
+                """Consumer clone that yields items from the buffer."""
+                while True:
+                    with lock:
+                        if buffer:
+                            yield buffer.popleft()
+                        elif stop_iteration_flag:
+                            return
+
+            # Start feeding the buffer in a separate thread
+            threading.Thread(target=feeder, daemon=True).start()
+
+            return clone(), clone()
+
+        res, res_copy = tee_generator(res)
+
+        thread = threading.Thread(target=finalize, args=(res,), daemon=True)
+        thread.start()
+
+        return StreamingResponse(res_copy, media_type="text/event-stream")
 
     except (MilvusException, MilvusUnavailableException) as e:
         exception_msg = "Error from milvus server. Please ensure you have ingested some documents. Please check chain-server logs for more details."
